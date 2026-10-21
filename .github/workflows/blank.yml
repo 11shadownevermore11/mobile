@@ -8,6 +8,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./mobile 
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,7 +26,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Make gradlew executable
-        run: chmod +x ./gradlew
+        run: chmod +x gradlew 
 
       - name: Build Debug APK
         run: ./gradlew assembleDebug
@@ -31,4 +35,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: mobile/app/build/outputs/apk/debug/app-debug.apk 
