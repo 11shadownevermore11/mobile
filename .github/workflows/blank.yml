@@ -1,38 +1,172 @@
 name: Build APK
 
+# Как пользоваться:
+#   1. Положите zip-архив с проектом в репозиторий (в любую папку) и сделайте push.
+#      Внутри архива может быть любая вложенность: workflow сам найдёт папку с gradlew / settings.gradle(.kts).
+#   2. Через 3–5 минут APK появится:
+#      • в Actions → этот запуск → Artifacts (app-debug-…);
+#      • в Releases → «APK (последняя сборка)» — оттуда удобно скачать прямо на телефон.
+#   Если zip в коммите нет — собирается папка ./mobile из репозитория (как раньше).
+#   Собрать конкретный архив вручную: Actions → Build APK → Run workflow → путь к zip.
+
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      zip:
+        description: "Путь к zip в репозитории (пусто — последний добавленный zip или ./mobile)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # для публикации APK в Releases
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./mobile 
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # нужна история, чтобы найти zip из этого push
+
+      - name: Find zip from this push
+        id: zip
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.zip }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          git config --global core.quotePath false            # имена с кириллицей и пробелами — как есть
+          is_zero() { [ -z "$1" ] || echo "$1" | grep -qE '^0+$'; }
+          last_zip_in_history() { git log -1 --diff-filter=AM --name-only --pretty=format: -- '*.zip' '*.ZIP' | grep . | tail -n 1 || true; }
+
+          ZIP=""
+          if [ -n "$INPUT_ZIP" ]; then
+            ZIP="$INPUT_ZIP"                                   # указан вручную
+          elif [ "$EVENT" = "workflow_dispatch" ]; then
+            ZIP=$(last_zip_in_history)                         # ручной запуск — последний добавленный zip
+          elif ! is_zero "$BEFORE" && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            ZIP=$(git diff --name-only --diff-filter=AM "$BEFORE" "$AFTER" -- '*.zip' '*.ZIP' | tail -n 1)   # zip из этого push
+          else
+            ZIP=$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$AFTER" -- '*.zip' '*.ZIP' | tail -n 1)  # первый push ветки
+          fi
+
+          if [ -n "$ZIP" ]; then
+            if [ ! -f "$ZIP" ]; then echo "::error::Файл $ZIP не найден в репозитории"; exit 1; fi
+            echo "Собираем из архива: $ZIP"
+            echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+            NAME=$(basename "$ZIP" | sed 's/\.[zZ][iI][pP]$//' | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/__*/_/g; s/^_//; s/_$//' | cut -c1-50)
+            [ -z "$NAME" ] && NAME="zip"
+            echo "name=$NAME-${AFTER::7}" >> "$GITHUB_OUTPUT"
+          elif [ -d mobile ]; then
+            echo "zip в этом push нет — собираем ./mobile"
+            echo "name=mobile-${AFTER::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::В этом push нет zip-архива и нет папки mobile — собирать нечего"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Unpack and locate Gradle project
+        if: steps.zip.outputs.skip != 'true'
+        id: project
+        env:
+          ZIP: ${{ steps.zip.outputs.path }}
+        run: |
+          if [ -n "$ZIP" ]; then
+            SRC="$RUNNER_TEMP/src"
+            rm -rf "$SRC" && mkdir -p "$SRC"
+            unzip -q -o "$ZIP" -d "$SRC"
+          else
+            SRC="$GITHUB_WORKSPACE/mobile"
+          fi
+
+          # Папка проекта = где лежит settings.gradle(.kts); при нескольких — самая «верхняя».
+          SETTINGS=$(find "$SRC" \( -name settings.gradle.kts -o -name settings.gradle \) \
+                       -not -path '*/build/*' -not -path '*/node_modules/*' -not -path '*/__MACOSX/*' \
+                     | awk '{ print gsub("/","/") "\t" $0 }' | sort -n | head -n 1 | cut -f2-)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::В архиве не найден Android-проект (нет settings.gradle или settings.gradle.kts)"
+            find "$SRC" -maxdepth 3 | head -50
+            exit 1
+          fi
+          DIR=$(dirname "$SETTINGS")
+          echo "Проект: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+          # Архив из Windows: убрать CRLF в gradlew и сделать его исполняемым
+          if [ -f "$DIR/gradlew" ]; then
+            sed -i 's/\r$//' "$DIR/gradlew"
+            chmod +x "$DIR/gradlew"
+          fi
+          if [ -f "$DIR/gradlew" ] && [ -f "$DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "wrapper=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::gradle wrapper в архиве неполный — используем Gradle 8.11.1"
+            echo "wrapper=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up JDK 17
+        if: steps.zip.outputs.skip != 'true'
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Setup Gradle
+        if: steps.zip.outputs.skip != 'true'
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Make gradlew executable
-        run: chmod +x gradlew 
+        with:
+          gradle-version: ${{ steps.project.outputs.wrapper == 'true' && 'wrapper' || '8.11.1' }}
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        if: steps.zip.outputs.skip != 'true'
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          if [ "${{ steps.project.outputs.wrapper }}" = "true" ]; then
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
 
-      - name: Upload APK
+      - name: Collect APK
+        if: steps.zip.outputs.skip != 'true'
+        id: apk
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          APK=$(find . -path '*/build/outputs/apk/debug/*.apk' | head -n 1)
+          if [ -z "$APK" ]; then echo "::error::APK не найден после сборки"; exit 1; fi
+          OUT="$RUNNER_TEMP/kod-novorossii.apk"   # постоянное имя — постоянная ссылка в Releases
+          cp "$APK" "$OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT"
+
+      - name: Upload APK artifact
+        if: steps.zip.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: mobile/app/build/outputs/apk/debug/app-debug.apk 
+          name: app-debug-${{ steps.zip.outputs.name }}
+          path: ${{ steps.apk.outputs.file }}
+          if-no-files-found: error
+
+      - name: Publish APK to Releases
+        if: steps.zip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.apk.outputs.file }}
+        run: |
+          TAG=apk-latest
+          NOTES="Сборка из ${{ steps.zip.outputs.path || 'mobile/' }}, коммит ${GITHUB_SHA::7}, $(date -u '+%Y-%m-%d %H:%M UTC')"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$APK" --title "APK (последняя сборка)" --notes "$NOTES" --prerelease
+          fi
