@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Карта</title>
+<!-- Офлайн-карта ДНР: движок MapLibre GL и векторные тайлы OpenStreetMap лежат внутри приложения (assets/map).
+     Страница не обращается к сети: тайлы, шрифты и скрипты отдаются из APK. -->
+<link rel="stylesheet" href="maplibre-gl.css">
+<script src="maplibre-gl.js"></script>
+<style>
+html,body,#m{margin:0;padding:0;width:100%;height:100%;background:#F3F1ED;overflow:hidden}
+body.dark,body.dark #m{background:#1C1F24}
+.pin{width:30px;height:30px;border-radius:50%;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#fff;font:700 13px sans-serif;box-sizing:border-box;cursor:pointer}
+.dot{width:8px;height:8px;border-radius:50%;background:#fff}
+.cl{border-radius:50%;border:3px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;color:#fff;font:700 15px sans-serif;box-sizing:border-box;cursor:pointer}
+.me{width:20px;height:20px;border-radius:50%;background:#1B4FA3;border:3px solid #fff;box-shadow:0 0 0 6px rgba(27,79,163,.3);box-sizing:border-box}
+.maplibregl-ctrl-attrib{font:11px sans-serif}
+body.dark .maplibregl-ctrl-attrib{background:rgba(28,31,36,.7);color:#aab}
+body.dark .maplibregl-ctrl-attrib a{color:#aab}
+body.dark .maplibregl-ctrl-group{background:#2A2E35}
+body.dark .maplibregl-ctrl-group button+button{border-top-color:#3A3F48}
+body.dark .maplibregl-ctrl button .maplibregl-ctrl-icon{filter:invert(1)}
+body.dark .maplibregl-ctrl-attrib-button{filter:invert(1)}
+</style>
+</head>
+<body>
+<div id="m"></div>
+<script>
+// Мост в Kotlin. В обычном браузере (для проверки страницы) его нет — подставляем заглушку.
+var A = window.Android || {ready: function () {}, fail: function (m) { console.error(m); }, pin: function () {}, cluster: function () {}, shape: function () {}};
+
+var BASE = location.href.replace(/[?#].*$/, '').replace(/[^/]*$/, '');
+// Область, для которой в приложение встроены тайлы (юг — Белосарайская коса, север — Горловка/Дебальцево).
+var REGION = [[37.15, 46.80], [39.05, 48.40]];
+var DEFAULT_CENTER = [37.804, 48.008];
+
+var map, last = {}, cur = null, pinMarkers = [], meMarker = null, dark = false;
+
+function esc(t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
+function col(c) { return /^#[0-9a-fA-F]{3,8}$/.test(c || '') ? c : '#1B4FA3'; }
+// Масштабы приложения — как у Яндекс Карт и osmdroid (тайл 256 px); у MapLibre тайл 512 px, поэтому на единицу меньше.
+function z2ml(z) { return z - 1; }
+function ml2z(z) { return z + 1; }
+
+// ---------- Стиль карты (схема OpenMapTiles), светлый и тёмный ----------
+var PAL = {
+  light: {
+    bg: '#F3F1ED', water: '#AAD3F0', waterLine: '#8FC3EA', wood: '#CFE6B8', grass: '#DCEDC8', farm: '#F0EEE3', park: '#C8E6B0',
+    residential: '#ECE8E1', industrial: '#E6E2EA', cemetery: '#D6E6CE', sand: '#F5EBC9', building: '#E2DDD5', buildingLine: '#D3CDC3',
+    casing: '#D4CFC6', motorway: '#FFD27A', motorwayCase: '#E8A93B', trunk: '#FFE19C', primary: '#FFFFFF', minor: '#FFFFFF',
+    path: '#C9C2B6', rail: '#B5AFA6', aeroway: '#E1DED8', boundary: '#9E8FB8',
+    text: '#33302B', textMinor: '#6B655C', halo: 'rgba(255,255,255,0.92)', waterText: '#3E79A8',
+  },
+  dark: {
+    bg: '#1C1F24', water: '#1C3349', waterLine: '#24425E', wood: '#1F2D25', grass: '#222F27', farm: '#202328', park: '#20342A',
+    residential: '#22262C', industrial: '#262530', cemetery: '#21302A', sand: '#2E2B22', building: '#2B2F37', buildingLine: '#343944',
+    casing: '#15171B', motorway: '#7A6232', motorwayCase: '#4C3D1F', trunk: '#5E5338', primary: '#4A505B', minor: '#3A3F48',
+    path: '#4A4F58', rail: '#555A63', aeroway: '#2C3037', boundary: '#7C6E99',
+    text: '#E1E3E8', textMinor: '#9EA3AD', halo: 'rgba(20,22,26,0.9)', waterText: '#7FA9CF',
+  },
+};
+
+function lw(pairs) { // ширина линии по масштабу
+  var e = ['interpolate', ['exponential', 1.5], ['zoom']];
+  pairs.forEach(function (p) { e.push(p[0], p[1]); });
+  return e;
+}
+
+function buildStyle(isDark) {
+  var c = isDark ? PAL.dark : PAL.light;
+  var cls = ['get', 'class'];
+  var major = ['match', cls, ['motorway', 'trunk', 'primary'], true, false];
+  var mid = ['match', cls, ['secondary', 'tertiary'], true, false];
+  var minor = ['match', cls, ['minor', 'service', 'busway'], true, false];
+  var name = ['coalesce', ['get', 'name'], ['get', 'name_int']];
+  var R = ['NotoSans-Regular'], M = ['NotoSans-Medium'], I = ['NotoSans-Italic'];
+  return {
+    version: 8,
+    glyphs: BASE + 'fonts/{fontstack}/{range}.pbf',
+    sources: {
+      omt: {type: 'vector', tiles: [BASE + 'tiles/{z}/{x}/{y}.pbf'], minzoom: 0, maxzoom: 14, bounds: [REGION[0][0], REGION[0][1], REGION[1][0], REGION[1][1]],
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">участники OpenStreetMap</a>'},
+      line: {type: 'geojson', data: {type: 'FeatureCollection', features: []}},
+      shapes: {type: 'geojson', data: {type: 'FeatureCollection', features: []}},
+    },
+    layers: [
+      {id: 'bg', type: 'background', paint: {'background-color': c.bg}},
+      {id: 'landcover-farm', type: 'fill', source: 'omt', 'source-layer': 'landcover', filter: ['match', cls, ['farmland'], true, false], paint: {'fill-color': c.farm}},
+      {id: 'landcover-grass', type: 'fill', source: 'omt', 'source-layer': 'landcover', filter: ['match', cls, ['grass', 'meadow', 'scrub'], true, false], paint: {'fill-color': c.grass, 'fill-opacity': 0.8}},
+      {id: 'landcover-wood', type: 'fill', source: 'omt', 'source-layer': 'landcover', filter: ['match', cls, ['wood', 'forest'], true, false], paint: {'fill-color': c.wood}},
+      {id: 'landcover-sand', type: 'fill', source: 'omt', 'source-layer': 'landcover', filter: ['match', cls, ['sand', 'beach'], true, false], paint: {'fill-color': c.sand}},
+      {id: 'landuse-res', type: 'fill', source: 'omt', 'source-layer': 'landuse', filter: ['match', cls, ['residential', 'suburb', 'neighbourhood', 'quarter', 'commercial', 'retail'], true, false], paint: {'fill-color': c.residential}},
+      {id: 'landuse-ind', type: 'fill', source: 'omt', 'source-layer': 'landuse', filter: ['match', cls, ['industrial', 'railway', 'garages'], true, false], paint: {'fill-color': c.industrial}},
+      {id: 'landuse-green', type: 'fill', source: 'omt', 'source-layer': 'landuse', filter: ['match', cls, ['cemetery', 'pitch', 'stadium', 'playground'], true, false], paint: {'fill-color': c.cemetery}},
+      {id: 'park', type: 'fill', source: 'omt', 'source-layer': 'park', paint: {'fill-color': c.park, 'fill-opacity': 0.9}},
+      {id: 'water', type: 'fill', source: 'omt', 'source-layer': 'water', paint: {'fill-color': c.water}},
+      {id: 'waterway', type: 'line', source: 'omt', 'source-layer': 'waterway', minzoom: 8, paint: {'line-color': c.waterLine, 'line-width': lw([[8, 0.6], [14, 2], [18, 5]])}},
+      {id: 'aeroway', type: 'fill', source: 'omt', 'source-layer': 'aeroway', filter: ['==', ['geometry-type'], 'Polygon'], paint: {'fill-color': c.aeroway}},
+      {id: 'building', type: 'fill', source: 'omt', 'source-layer': 'building', minzoom: 13,
+        paint: {'fill-color': c.building, 'fill-outline-color': c.buildingLine, 'fill-opacity': ['interpolate', ['linear'], ['zoom'], 13, 0.5, 15, 1]}},
+      {id: 'boundary', type: 'line', source: 'omt', 'source-layer': 'boundary', filter: ['all', ['<=', ['get', 'admin_level'], 4], ['!=', ['get', 'maritime'], 1]],
+        paint: {'line-color': c.boundary, 'line-width': lw([[5, 0.8], [12, 2]]), 'line-dasharray': [3, 2], 'line-opacity': 0.7}},
+      // Дороги: сначала обводка, потом заливка
+      {id: 'road-path', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 14, filter: ['match', cls, ['path', 'track'], true, false],
+        paint: {'line-color': c.path, 'line-width': lw([[14, 0.8], [18, 2]]), 'line-dasharray': [2, 1.5]}},
+      {id: 'road-minor-case', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 12, filter: minor, layout: {'line-cap': 'round', 'line-join': 'round'},
+        paint: {'line-color': c.casing, 'line-width': lw([[12, 0.8], [14, 4], [18, 18]])}},
+      {id: 'road-mid-case', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 9, filter: mid, layout: {'line-cap': 'round', 'line-join': 'round'},
+        paint: {'line-color': c.casing, 'line-width': lw([[9, 1], [12, 3], [14, 7], [18, 26]])}},
+      {id: 'road-major-case', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 6, filter: major, layout: {'line-cap': 'round', 'line-join': 'round'},
+        paint: {'line-color': ['match', cls, ['motorway', 'trunk'], c.motorwayCase, c.casing], 'line-width': lw([[6, 1], [10, 3], [14, 9], [18, 32]])}},
+      {id: 'road-minor', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 12, filter: minor, layout: {'line-cap': 'round', 'line-join': 'round'},
+        paint: {'line-color': c.minor, 'line-width': lw([[12, 0.4], [14, 2.8], [18, 15]])}},
+      {id: 'road-mid', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 9, filter: mid, layout: {'line-cap': 'round', 'line-join': 'round'},
+        paint: {'line-color': c.primary, 'line-width': lw([[9, 0.6], [12, 2], [14, 5.5], [18, 22]])}},
+      {id: 'road-major', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 6, filter: major, layout: {'line-cap': 'round', 'line-join': 'round'},
+        paint: {'line-color': ['match', cls, 'motorway', c.motorway, 'trunk', c.trunk, c.primary], 'line-width': lw([[6, 0.6], [10, 2], [14, 7], [18, 28]])}},
+      {id: 'rail', type: 'line', source: 'omt', 'source-layer': 'transportation', minzoom: 10, filter: ['match', cls, ['rail', 'transit'], true, false],
+        paint: {'line-color': c.rail, 'line-width': lw([[10, 0.6], [16, 2]]), 'line-dasharray': [4, 3]}},
+      // Наши объекты: контуры площадок и линия маршрута — под подписями
+      {id: 'shapes-fill', type: 'fill', source: 'shapes', paint: {'fill-color': ['get', 'color'], 'fill-opacity': 0.25}},
+      {id: 'shapes-line', type: 'line', source: 'shapes', paint: {'line-color': ['get', 'color'], 'line-width': 2}},
+      {id: 'route-case', type: 'line', source: 'line', layout: {'line-cap': 'round', 'line-join': 'round'}, paint: {'line-color': '#FFFFFF', 'line-width': 8, 'line-opacity': 0.9}},
+      {id: 'route', type: 'line', source: 'line', layout: {'line-cap': 'round', 'line-join': 'round'}, paint: {'line-color': ['get', 'color'], 'line-width': 5, 'line-opacity': 0.9}},
+      // Подписи
+      {id: 'water-name', type: 'symbol', source: 'omt', 'source-layer': 'water_name', layout: {'text-field': name, 'text-font': I, 'text-size': 12, 'text-max-width': 8},
+        paint: {'text-color': c.waterText, 'text-halo-color': c.halo, 'text-halo-width': 1.2}},
+      {id: 'waterway-name', type: 'symbol', source: 'omt', 'source-layer': 'waterway', minzoom: 12, layout: {'text-field': name, 'text-font': I, 'text-size': 11, 'symbol-placement': 'line'},
+        paint: {'text-color': c.waterText, 'text-halo-color': c.halo, 'text-halo-width': 1.2}},
+      {id: 'road-name', type: 'symbol', source: 'omt', 'source-layer': 'transportation_name', minzoom: 13,
+        layout: {'text-field': name, 'text-font': R, 'text-size': lw([[13, 10], [17, 13]]), 'symbol-placement': 'line', 'text-rotation-alignment': 'map', 'text-max-angle': 30},
+        paint: {'text-color': c.textMinor, 'text-halo-color': c.halo, 'text-halo-width': 1.5}},
+      {id: 'housenumber', type: 'symbol', source: 'omt', 'source-layer': 'housenumber', minzoom: 16,
+        layout: {'text-field': ['get', 'housenumber'], 'text-font': R, 'text-size': 10, 'text-padding': 2},
+        paint: {'text-color': c.textMinor, 'text-halo-color': c.halo, 'text-halo-width': 1}},
+      {id: 'place-minor', type: 'symbol', source: 'omt', 'source-layer': 'place', minzoom: 11, filter: ['match', cls, ['suburb', 'neighbourhood', 'quarter', 'hamlet', 'isolated_dwelling'], true, false],
+        layout: {'text-field': name, 'text-font': R, 'text-size': ['match', cls, 'suburb', 13, 11], 'text-max-width': 8, 'text-transform': ['match', cls, 'suburb', 'uppercase', 'none'], 'text-letter-spacing': ['match', cls, 'suburb', 0.08, 0]},
+        paint: {'text-color': c.textMinor, 'text-halo-color': c.halo, 'text-halo-width': 1.5}},
+      {id: 'place-village', type: 'symbol', source: 'omt', 'source-layer': 'place', minzoom: 9, filter: ['match', cls, ['village'], true, false],
+        layout: {'text-field': name, 'text-font': R, 'text-size': lw([[9, 10], [14, 14]]), 'text-max-width': 8},
+        paint: {'text-color': c.text, 'text-halo-color': c.halo, 'text-halo-width': 1.5}},
+      {id: 'place-town', type: 'symbol', source: 'omt', 'source-layer': 'place', minzoom: 7, filter: ['match', cls, ['town'], true, false],
+        layout: {'text-field': name, 'text-font': M, 'text-size': lw([[7, 11], [12, 16]]), 'text-max-width': 8},
+        paint: {'text-color': c.text, 'text-halo-color': c.halo, 'text-halo-width': 1.6}},
+      {id: 'place-city', type: 'symbol', source: 'omt', 'source-layer': 'place', filter: ['match', cls, ['city'], true, false], maxzoom: 14,
+        layout: {'text-field': name, 'text-font': M, 'text-size': lw([[5, 12], [12, 20]]), 'text-max-width': 8},
+        paint: {'text-color': c.text, 'text-halo-color': c.halo, 'text-halo-width': 2}},
+    ],
+  };
+}
+
+// ---------- Метки и кластеры (как на Яндекс Картах: число объектов, цвет преобладающей категории) ----------
+function pinEl(p) {
+  var w = document.createElement('div');
+  w.innerHTML = '<div class="pin" style="background:' + col(p.color) + '">' + (p.order != null ? esc(p.order) : '<div class="dot"></div>') + '</div>';
+  var el = w.firstChild;
+  el.title = p.title || '';
+  el.addEventListener('click', function (e) { e.stopPropagation(); A.pin(p.id); });
+  return el;
+}
+
+function clusterEl(g) {
+  var counts = {};
+  g.forEach(function (p) { var c = col(p.color); counts[c] = (counts[c] || 0) + 1; });
+  var keys = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
+  var n = g.length, s = n < 10 ? 40 : n < 30 ? 48 : 56;
+  var ring = keys.length > 1 ? 'box-shadow:0 0 0 4px ' + keys[1] + '55,0 2px 8px rgba(0,0,0,.3);' : '';
+  var el = document.createElement('div');
+  el.className = 'cl';
+  el.style.cssText = 'width:' + s + 'px;height:' + s + 'px;background:' + keys[0] + ';' + ring;
+  el.textContent = n;
+  el.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var b = new maplibregl.LngLatBounds();
+    g.forEach(function (p) { b.extend([p.lng, p.lat]); });
+    var diag = b.getSouthWest().distanceTo(b.getNorthEast());
+    if (ml2z(map.getZoom()) >= 16 || diag < 60) A.cluster(JSON.stringify(g.map(function (p) { return p.id; })));
+    else map.fitBounds(b, {padding: 60, maxZoom: z2ml(17), duration: 500});
+  });
+  return el;
+}
+
+function drawPins() {
+  pinMarkers.forEach(function (m) { m.remove(); });
+  pinMarkers = [];
+  if (!cur) return;
+  var groups = [], cell = 80, index = {};
+  cur.pins.forEach(function (p) {
+    if (!cur.cluster) { groups.push([p]); return; }
+    var pt = map.project([p.lng, p.lat]);
+    var k = Math.floor(pt.x / cell) + ':' + Math.floor(pt.y / cell);
+    if (!index[k]) { index[k] = []; groups.push(index[k]); }
+    index[k].push(p);
+  });
+  groups.forEach(function (g) {
+    var lng = 0, lat = 0;
+    g.forEach(function (p) { lng += p.lng; lat += p.lat; });
+    var el = g.length === 1 ? pinEl(g[0]) : clusterEl(g);
+    pinMarkers.push(new maplibregl.Marker({element: el}).setLngLat([lng / g.length, lat / g.length]).addTo(map));
+  });
+}
+
+function fitTo(coords) {
+  if (!coords.length) return;
+  if (coords.length === 1) { map.jumpTo({center: coords[0], zoom: z2ml(15)}); return; }
+  var b = new maplibregl.LngLatBounds();
+  coords.forEach(function (c) { b.extend(c); });
+  map.fitBounds(b, {padding: 50, maxZoom: z2ml(15), duration: 0});
+}
+
+function drawExtra() {
+  var d = cur || {};
+  var line = {type: 'FeatureCollection', features: []};
+  if (d.line && d.line.length > 1) line.features.push({type: 'Feature', properties: {color: col(d.lineColor)},
+    geometry: {type: 'LineString', coordinates: d.line.map(function (c) { return [c[1], c[0]]; })}});
+  map.getSource('line').setData(line);
+  map.getSource('shapes').setData({type: 'FeatureCollection', features: (d.shapes || []).map(function (s, i) {
+    var ring = s.coords.map(function (c) { return [c[1], c[0]]; });
+    if (ring.length && (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1])) ring.push(ring[0]);
+    return {type: 'Feature', properties: {i: i, color: col(s.color), title: s.title}, geometry: {type: 'Polygon', coordinates: [ring]}};
+  })});
+  if (meMarker) { meMarker.remove(); meMarker = null; }
+  if (d.me) {
+    var el = document.createElement('div'); el.className = 'me';
+    meMarker = new maplibregl.Marker({element: el}).setLngLat([d.me[1], d.me[0]]).addTo(map);
+  }
+}
+
+// Вызывается из Kotlin: render({dark, cluster, fit, zoom, center:[lat,lng], me:[lat,lng], pins:[...], line:[[lat,lng]...], lineColor, shapes:[...]})
+function render(d) {
+  if (!map) return;
+  cur = d;
+  if (!!d.dark !== dark) {
+    dark = !!d.dark;
+    document.body.classList.toggle('dark', dark);
+    map.setStyle(buildStyle(dark));
+    map.once('styledata', function () { last.ex = null; render(cur); });
+    return;
+  }
+  var pk = JSON.stringify([d.pins, d.cluster]);
+  if (pk !== last.pins) {
+    last.pins = pk;
+    if (d.fit && d.pins.length) fitTo(d.pins.map(function (p) { return [p.lng, p.lat]; }));
+    drawPins();
+  }
+  var ek = JSON.stringify([d.line, d.lineColor, d.shapes, d.me]);
+  if (ek !== last.ex && map.getSource('line')) { last.ex = ek; drawExtra(); }
+  var ck = JSON.stringify(d.center || null);
+  if (d.center && ck !== last.center) {
+    var first = last.center === undefined;
+    last.center = ck;
+    if (!d.fit) {
+      var o = {center: [d.center[1], d.center[0]], zoom: z2ml(d.zoom || 15)};
+      if (first) map.jumpTo(o); else map.easeTo(Object.assign(o, {duration: 400}));
+    }
+  }
+}
+
+function init() {
+  if (!window.maplibregl) { A.fail('Не удалось запустить встроенную карту'); return; }
+  var cv = document.createElement('canvas');
+  if (!(cv.getContext('webgl2') || cv.getContext('webgl'))) { A.fail('Устройство не поддерживает WebGL — карта недоступна'); return; }
+  try {
+    map = new maplibregl.Map({
+      container: 'm', style: buildStyle(false), center: DEFAULT_CENTER, zoom: z2ml(12),
+      minZoom: 5, maxZoom: z2ml(19), maxBounds: [[REGION[0][0] - 1.5, REGION[0][1] - 1], [REGION[1][0] + 1.5, REGION[1][1] + 1]],
+      attributionControl: {compact: true}, dragRotate: false, pitchWithRotate: false, touchPitch: false, fadeDuration: 0,
+    });
+  } catch (e) { A.fail('Встроенная карта: ' + (e && e.message || e)); return; }
+  map.touchZoomRotate.disableRotation();
+  map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'bottom-right');
+  map.on('moveend', function () { if (cur && cur.cluster) drawPins(); });
+  map.on('click', 'shapes-fill', function (e) { var f = e.features && e.features[0]; if (f) A.shape(f.properties.i); });
+  map.on('error', function (e) { if (e && e.error && !/tiles\//.test(String(e.error.url || e.error.message || ''))) console.warn(e.error); });
+  map.once('load', function () { A.ready(); });
+}
+init();
+</script>
+</body>
+</html>

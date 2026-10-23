@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Сервер «Кода Новороссии» работает по HTTP (http://192.168.137.1:8000) — открытый трафик разрешён только к нему.
+     Все остальные адреса — только HTTPS. Карта встроена в приложение и в сеть не ходит. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.137.1</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,4 @@
+[out:xml][timeout:600][maxsize:536870912][bbox:{{S}},{{W}},{{N}},{{E}}];
+(nwr[highway];nwr[railway];nwr[waterway];nwr[natural];nwr[landuse];nwr[leisure];nwr[building];nwr[place];nwr[aeroway];nwr[bridge];relation[boundary=administrative][admin_level~"^[4-6]$"];);
+(._;>;);
+out body qt;

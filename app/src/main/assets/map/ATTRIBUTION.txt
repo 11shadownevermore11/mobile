@@ -1,0 +1,2 @@
+Картографические данные © участники OpenStreetMap (https://www.openstreetmap.org/copyright), лицензия ODbL 1.0.
+Тайлы собраны tilemaker по схеме OpenMapTiles. Движок карты — MapLibre GL JS (BSD-3-Clause). Шрифты — Noto Sans (SIL OFL 1.1).
