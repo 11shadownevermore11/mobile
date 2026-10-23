@@ -1,0 +1,276 @@
+
+name: Build APK
+
+# Поддерживаются:
+# 1. ZIP-архив с Android-проектом.
+# 2. Обычная папка с Android-проектом в любом месте репозитория.
+# 3. Ручной выбор папки или ZIP через Actions → Run workflow.
+#
+# APK появится в Artifacts и в Releases → APK (последняя сборка).
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "Путь к ZIP в репозитории (необязательно)"
+        required: false
+        default: ""
+        type: string
+      project_dir:
+        description: "Путь к папке приложения (например, MyApp или mobile). Имеет приоритет над ZIP"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find project source
+        id: source
+        env:
+          INPUT_ZIP: ${{ inputs.zip }}
+          INPUT_DIR: ${{ inputs.project_dir }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.quotePath false
+
+          ZIP=""
+          PROJECT_DIR=""
+
+          # 1. Если указана папка, используем именно её.
+          if [ -n "$INPUT_DIR" ]; then
+            PROJECT_DIR="${INPUT_DIR#./}"
+            if [ ! -d "$PROJECT_DIR" ]; then
+              echo "::error::Папка не найдена: $PROJECT_DIR"
+              exit 1
+            fi
+
+          else
+            # 2. Ищем ZIP: сначала ручной выбор,
+            # затем архивы из текущего push или последний добавленный архив.
+            if [ -n "$INPUT_ZIP" ]; then
+              ZIP="$INPUT_ZIP"
+            elif [ "$EVENT" = "push" ]; then
+              is_zero() {
+                [ -z "$1" ] || [[ "$1" =~ ^0+$ ]]
+              }
+
+              if ! is_zero "$BEFORE" &&
+                 git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                ZIP=$(git diff --name-only --diff-filter=AM \
+                  "$BEFORE" "$AFTER" -- '*.zip' '*.ZIP' | tail -n 1)
+              else
+                ZIP=$(git diff-tree --no-commit-id --name-only \
+                  --diff-filter=AM -r "$AFTER" -- '*.zip' '*.ZIP' |
+                  tail -n 1)
+              fi
+            else
+              ZIP=$(git log -1 --diff-filter=AM \
+                --name-only --pretty=format: -- '*.zip' '*.ZIP' |
+                grep . | tail -n 1 || true)
+            fi
+
+            if [ -n "$ZIP" ]; then
+              if [ ! -f "$ZIP" ]; then
+                echo "::error::ZIP не найден: $ZIP"
+                exit 1
+              fi
+            else
+              # 3. ZIP не найден — ищем обычный Android-проект
+              # в любой папке репозитория.
+              SETTINGS=$(find . -type f \
+                \( -name settings.gradle -o -name settings.gradle.kts \) \
+                -not -path './.git/*' \
+                -not -path '*/build/*' \
+                -not -path '*/.gradle/*' \
+                -not -path '*/node_modules/*' \
+                -not -path '*/__MACOSX/*' |
+                awk '{ print gsub("/", "/") "\t" $0 }' |
+                sort -n | head -n 1 | cut -f2-)
+
+              if [ -n "$SETTINGS" ]; then
+                PROJECT_DIR=$(dirname "$SETTINGS")
+              else
+                echo "::notice::Android-проект не найден. Сборка пропущена."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          fi
+
+          if [ -n "$ZIP" ]; then
+            echo "source_type=zip" >> "$GITHUB_OUTPUT"
+            echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+
+            NAME=$(basename "$ZIP" |
+              sed 's/\.[zZ][iI][pP]$//' |
+              LC_ALL=C tr -c 'A-Za-z0-9._-' '_' |
+              sed 's/__*/_/g; s/^_//; s/_$//' |
+              cut -c1-50)
+          else
+            echo "source_type=directory" >> "$GITHUB_OUTPUT"
+            echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+            NAME=$(basename "$PROJECT_DIR")
+            echo "Используется папка: $PROJECT_DIR"
+          fi
+
+          NAME=$(printf '%s' "$NAME" |
+            LC_ALL=C tr -c 'A-Za-z0-9._-' '_' |
+            cut -c1-50)
+          [ -n "$NAME" ] || NAME="android-app"
+
+          echo "name=${NAME}-${AFTER::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Android project
+        if: steps.source.outputs.skip != 'true'
+        id: project
+        env:
+          SOURCE_TYPE: ${{ steps.source.outputs.source_type }}
+          ZIP: ${{ steps.source.outputs.path }}
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$SOURCE_TYPE" = "zip" ]; then
+            SRC="$RUNNER_TEMP/src"
+            rm -rf "$SRC"
+            mkdir -p "$SRC"
+            unzip -q -o "$ZIP" -d "$SRC"
+          else
+            SRC="$GITHUB_WORKSPACE/$PROJECT_DIR"
+          fi
+
+          # Ищем корень Gradle-проекта, даже если он вложен
+          # в несколько папок.
+          SETTINGS=$(find "$SRC" -type f \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            -not -path '*/build/*' \
+            -not -path '*/.gradle/*' \
+            -not -path '*/node_modules/*' \
+            -not -path '*/__MACOSX/*' |
+            awk '{ print gsub("/", "/") "\t" $0 }' |
+            sort -n | head -n 1 | cut -f2-)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Android-проект не найден: отсутствует settings.gradle(.kts)"
+            find "$SRC" -maxdepth 4 -print | head -100
+            exit 1
+          fi
+
+          DIR=$(dirname "$SETTINGS")
+          echo "Корень проекта: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+          if [ -f "$DIR/gradlew" ]; then
+            sed -i 's/\r$//' "$DIR/gradlew"
+            chmod +x "$DIR/gradlew"
+          fi
+
+          if [ -f "$DIR/gradlew" ] &&
+             [ -f "$DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "wrapper=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Gradle Wrapper отсутствует или неполный; используется Gradle 8.11.1"
+            echo "wrapper=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.source.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Setup Gradle
+        if: steps.source.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.project.outputs.wrapper == 'true' && 'wrapper' || '8.11.1' }}
+
+      - name: Build Debug APK
+        if: steps.source.outputs.skip != 'true'
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          if [ "${{ steps.project.outputs.wrapper }}" = "true" ]; then
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Collect APK
+        if: steps.source.outputs.skip != 'true'
+        id: apk
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          APK=$(find . -type f \
+            -path '*/build/outputs/apk/debug/*.apk' | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK не найден после сборки"
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/kod-novorossii.apk"
+          cp "$APK" "$OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+
+      - name: Upload APK artifact
+        if: steps.source.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ steps.source.outputs.name }}
+          path: ${{ steps.apk.outputs.file }}
+          if-no-files-found: error
+
+      - name: Publish APK to Releases
+        if: steps.source.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.apk.outputs.file }}
+          SOURCE_TYPE: ${{ steps.source.outputs.source_type }}
+          SOURCE_PATH: ${{ steps.source.outputs.path }}
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          TAG=apk-latest
+
+          if [ "$SOURCE_TYPE" = "zip" ]; then
+            SOURCE="$SOURCE_PATH"
+          else
+            SOURCE="$PROJECT_DIR/"
+          fi
+
+          NOTES="Сборка из ${SOURCE}, коммит ${GITHUB_SHA::7}, $(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$APK" \
+              --title "APK (последняя сборка)" \
+              --notes "$NOTES" --prerelease
+          fi
